@@ -1,0 +1,35 @@
+name: HubSpot Daily Backup to Wasabi
+
+on:
+  schedule:
+    # 02:00 UTC daily. Adjust to whatever time suits you.
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      full_sync:
+        description: 'Force a full export instead of incremental'
+        required: false
+        default: 'false'
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run backup
+        env:
+          HUBSPOT_PRIVATE_APP_TOKEN: ${{ secrets.HUBSPOT_PRIVATE_APP_TOKEN }}
+          WASABI_ACCESS_KEY: ${{ secrets.WASABI_ACCESS_KEY }}
+          WASABI_SECRET_KEY: ${{ secrets.WASABI_SECRET_KEY }}
+          WASABI_BUCKET: ${{ secrets.WASABI_BUCKET }}
+          WASABI_REGION: ${{ secrets.WASABI_REGION }}
+          FULL_SYNC: ${{ github.event.inputs.full_sync || 'false' }}
+        run: python backup_hubspot_to_wasabi.py
