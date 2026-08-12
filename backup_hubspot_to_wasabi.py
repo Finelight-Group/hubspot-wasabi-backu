@@ -29,6 +29,15 @@ Known limitations (v1 — see README for details):
       query at 10,000 matching results. A single day's changes should
       never come close to that, but if you ever see a warning about it,
       the fix is to chunk the incremental window (e.g. by hour).
+
+Output format:
+    Each object type is written as a .jsonl file (one JSON record per line)
+    rather than a single JSON array. This is deliberate: earlier versions
+    built the full record list in memory before writing it out, which is
+    fine for small object types but can exceed the GitHub Actions runner's
+    memory limit (8 GB on private repos) for very large tables like
+    contacts. Streaming one record at a time keeps memory usage bounded to
+    roughly one page (100 records) regardless of table size.
 """
 
 import json
@@ -150,27 +159,46 @@ def fetch_object_properties(object_type):
     return [p["name"] for p in data.get("results", [])]
 
 
-def list_all_records(object_type, properties):
-    """Full export via the plain list endpoint (no 10k result cap)."""
-    records = []
+PROGRESS_LOG_EVERY = 1000  # log a progress line every N records, not just at the end
+
+
+def list_all_records_streaming(object_type, properties, out_file):
+    """Full export via the plain list endpoint (no 10k result cap).
+
+    Writes one JSON record per line directly to out_file as each page
+    arrives, instead of accumulating everything in memory first. This is
+    what keeps a table with hundreds of thousands of rows from exhausting
+    the runner's memory.
+    """
+    count = 0
     after = None
     while True:
         params = {"limit": 100, "properties": ",".join(properties[:200])}
         if after:
             params["after"] = after
         data = hubspot_request("GET", f"/crm/v3/objects/{object_type}", params=params)
-        records.extend(data.get("results", []))
+        for record in data.get("results", []):
+            out_file.write(json.dumps(record))
+            out_file.write("\n")
+            count += 1
+            if count % PROGRESS_LOG_EVERY == 0:
+                log.info(f"{object_type}: {count} records so far...")
         paging = data.get("paging")
         if paging and paging.get("next"):
             after = paging["next"]["after"]
         else:
             break
-    return records
+    return count
 
 
-def search_modified_since(object_type, properties, since_iso):
-    """Incremental export via the search endpoint (supports filtering, capped at 10k results)."""
-    records = []
+def search_modified_since_streaming(object_type, properties, since_iso, out_file):
+    """Incremental export via the search endpoint (supports filtering, capped at 10k results).
+
+    Same streaming approach as list_all_records_streaming, for the same
+    memory-safety reason — a very active day of changes could still be a
+    lot of records for a busy portal.
+    """
+    count = 0
     after = None
     while True:
         body = {
@@ -191,18 +219,23 @@ def search_modified_since(object_type, properties, since_iso):
         if after:
             body["after"] = after
         data = hubspot_request("POST", f"/crm/v3/objects/{object_type}/search", json=body)
-        records.extend(data.get("results", []))
+        for record in data.get("results", []):
+            out_file.write(json.dumps(record))
+            out_file.write("\n")
+            count += 1
+            if count % PROGRESS_LOG_EVERY == 0:
+                log.info(f"{object_type}: {count} records so far...")
         paging = data.get("paging")
         if paging and paging.get("next"):
             after = paging["next"]["after"]
         else:
             break
-    if len(records) >= 10000:
+    if count >= 10000:
         log.warning(
-            f"{object_type}: hit or near the 10k search cap ({len(records)} records) — "
+            f"{object_type}: hit or near the 10k search cap ({count} records) — "
             "some changes may be missing. Consider chunking the incremental window."
         )
-    return records
+    return count
 
 
 def export_object_type(object_type, since_iso):
@@ -216,19 +249,20 @@ def export_object_type(object_type, since_iso):
     if "hs_lastmodifieddate" not in props:
         props.append("hs_lastmodifieddate")
 
+    out_path = WORKDIR / f"{object_type}.jsonl"
     try:
-        if since_iso:
-            records = search_modified_since(object_type, props, since_iso)
-        else:
-            records = list_all_records(object_type, props)
+        with out_path.open("w") as out_file:
+            if since_iso:
+                count = search_modified_since_streaming(object_type, props, since_iso, out_file)
+            else:
+                count = list_all_records_streaming(object_type, props, out_file)
     except requests.HTTPError as e:
         log.warning(f"Skipping {object_type}: fetch failed ({e})")
+        out_path.unlink(missing_ok=True)
         return None
 
-    out_path = WORKDIR / f"{object_type}.json"
-    out_path.write_text(json.dumps(records, indent=2))
-    log.info(f"{object_type}: exported {len(records)} records")
-    return len(records)
+    log.info(f"{object_type}: exported {count} records")
+    return count
 
 
 def main():
