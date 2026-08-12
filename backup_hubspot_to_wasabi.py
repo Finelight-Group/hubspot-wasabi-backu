@@ -3,12 +3,18 @@
 Daily HubSpot -> Wasabi backup.
 
 Pulls HubSpot CRM records (standard objects + all custom object types the
-private app token can see), packages them as JSON, zips them, and uploads
-the zip to a Wasabi bucket (S3-compatible).
+private app token can see) and uploads each object type to a Wasabi bucket
+(S3-compatible) as a .jsonl file the moment that object type finishes —
+not batched into one archive at the end of the run. That way, if the
+process dies partway through (e.g. on a very large table), everything
+that already finished is safely in Wasabi rather than lost with the rest
+of the run. Objects are processed roughly smallest-to-largest, with
+"contacts" (by far the biggest table) run last for the same reason.
 
 First run (or when FULL_SYNC=true) does a complete export of every record.
 Subsequent runs only pull records modified since the last successful run,
-using a small state file stored in the same Wasabi bucket.
+using a small state file stored in the same Wasabi bucket. The watermark
+only advances if every object type in the run succeeded.
 
 Required environment variables:
     HUBSPOT_PRIVATE_APP_TOKEN   HubSpot private app access token
@@ -37,7 +43,10 @@ Output format:
     fine for small object types but can exceed the GitHub Actions runner's
     memory limit (8 GB on private repos) for very large tables like
     contacts. Streaming one record at a time keeps memory usage bounded to
-    roughly one page (100 records) regardless of table size.
+    roughly one page (100 records) regardless of table size. Each file is
+    uploaded to Wasabi as soon as it's written, then deleted locally, so
+    disk usage also stays bounded regardless of how many object types a
+    portal has.
 """
 
 import json
@@ -46,7 +55,6 @@ import os
 import shutil
 import sys
 import time
-import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -80,8 +88,13 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+# "contacts" is deliberately not in this list — it's the biggest table by far
+# (over a million rows) and is appended at the very end of the run order in
+# main(), after everything else (including custom objects) has already
+# uploaded. That way, if something kills the process on contacts, every
+# other object type is already safely sitting in Wasabi instead of being
+# lost along with it.
 STANDARD_OBJECTS = [
-    "contacts",
     "companies",
     "deals",
     "tickets",
@@ -238,10 +251,23 @@ def search_modified_since_streaming(object_type, properties, since_iso, out_file
     return count
 
 
-def export_object_type(object_type, since_iso):
+def upload_manifest(s3, manifest):
+    """Overwrite the manifest in Wasabi after every object type, not just at the
+    end — so even a run that dies partway through leaves an accurate record in
+    Wasabi of exactly what did and didn't make it."""
+    key = f"hubspot-backups/{RUN_DATE}/_manifest.json"
+    s3.put_object(
+        Bucket=WASABI_BUCKET,
+        Key=key,
+        Body=json.dumps(manifest, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
+def export_object_type(object_type, since_iso, s3):
     try:
         props = fetch_object_properties(object_type)
-    except requests.HTTPError as e:
+    except (requests.HTTPError, RuntimeError) as e:
         log.warning(f"Skipping {object_type}: could not fetch properties ({e})")
         return None
     # hs_lastmodifieddate isn't a real property on every object type (e.g. some
@@ -256,12 +282,27 @@ def export_object_type(object_type, since_iso):
                 count = search_modified_since_streaming(object_type, props, since_iso, out_file)
             else:
                 count = list_all_records_streaming(object_type, props, out_file)
-    except requests.HTTPError as e:
+    except (requests.HTTPError, RuntimeError) as e:
         log.warning(f"Skipping {object_type}: fetch failed ({e})")
         out_path.unlink(missing_ok=True)
         return None
 
-    log.info(f"{object_type}: exported {count} records")
+    log.info(f"{object_type}: exported {count} records, uploading to Wasabi...")
+
+    # Upload this object type's file the moment it's done, rather than waiting
+    # for every other object type to finish first. This is the key change: if
+    # the process dies later (e.g. on contacts), everything uploaded so far is
+    # already safe in Wasabi instead of being lost with the rest of the run.
+    key = f"hubspot-backups/{RUN_DATE}/{object_type}.jsonl"
+    try:
+        s3.upload_file(str(out_path), WASABI_BUCKET, key)
+    except Exception as e:
+        log.warning(f"{object_type}: exported {count} records but upload to Wasabi failed: {e}")
+        return None
+    log.info(f"{object_type}: uploaded to wasabi://{WASABI_BUCKET}/{key}")
+
+    # Free the local disk copy now that it's safely uploaded.
+    out_path.unlink(missing_ok=True)
     return count
 
 
@@ -273,37 +314,43 @@ def main():
     mode = "FULL" if since_iso is None else f"INCREMENTAL since {since_iso}"
     log.info(f"Starting HubSpot backup ({mode})")
 
+    # Run order: every standard object except contacts, then every custom
+    # object type, then contacts last of all. Contacts is by far the biggest
+    # table (over a million rows) — putting it last means a failure there
+    # doesn't take the rest of the backup down with it.
     object_types = list(STANDARD_OBJECTS)
     try:
         custom_types = discover_custom_object_types()
         log.info(f"Discovered {len(custom_types)} custom object type(s): {custom_types}")
         object_types += custom_types
-    except requests.HTTPError as e:
+    except (requests.HTTPError, RuntimeError) as e:
         log.warning(f"Could not discover custom objects (check private app scopes): {e}")
+    object_types.append("contacts")
 
-    manifest = {"run_date": RUN_DATE, "mode": mode, "object_counts": {}}
+    manifest = {"run_date": RUN_DATE, "mode": mode, "object_counts": {}, "complete": False}
+    all_succeeded = True
     for obj_type in object_types:
-        count = export_object_type(obj_type, since_iso)
+        count = export_object_type(obj_type, since_iso, s3)
         manifest["object_counts"][obj_type] = count
+        if count is None:
+            all_succeeded = False
+        upload_manifest(s3, manifest)
 
-    (WORKDIR / "_manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest["complete"] = True
+    upload_manifest(s3, manifest)
 
-    zip_path = Path(f"hubspot-backup-{RUN_DATE}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in WORKDIR.iterdir():
-            zf.write(f, f.name)
+    # Only advance the incremental watermark once every object type in this
+    # run succeeded. If anything was skipped, the next run stays in
+    # incremental-since-last-known-good mode (or full, if there's no
+    # watermark yet) so nothing quietly falls through the gap.
+    if all_succeeded:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        set_last_run_timestamp(s3, now_iso)
+    else:
+        log.warning("One or more object types failed — not advancing the incremental watermark.")
 
-    key = f"hubspot-backups/{RUN_DATE}/{zip_path.name}"
-    s3.upload_file(str(zip_path), WASABI_BUCKET, key)
-    log.info(f"Uploaded {zip_path.name} to wasabi://{WASABI_BUCKET}/{key}")
-
-    # Only advance the incremental watermark once the upload has succeeded.
-    now_iso = datetime.now(timezone.utc).isoformat()
-    set_last_run_timestamp(s3, now_iso)
-
-    shutil.rmtree(WORKDIR)
-    zip_path.unlink()
-    log.info("Backup complete.")
+    shutil.rmtree(WORKDIR, ignore_errors=True)
+    log.info("Backup complete." if all_succeeded else "Backup finished with some object types skipped — see manifest.")
 
 
 if __name__ == "__main__":
