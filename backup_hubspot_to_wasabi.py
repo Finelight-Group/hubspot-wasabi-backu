@@ -150,8 +150,22 @@ def set_last_run_timestamp(s3, iso_ts):
 
 def hubspot_request(method, path, **kwargs):
     url = f"{HUBSPOT_API_BASE}{path}"
+    last_network_error = None
     for attempt in range(6):
-        resp = requests.request(method, url, headers=HEADERS, timeout=30, **kwargs)
+        try:
+            resp = requests.request(method, url, headers=HEADERS, timeout=30, **kwargs)
+        except requests.exceptions.RequestException as e:
+            # Covers connection resets, timeouts, DNS blips, TLS hiccups, etc.
+            # These are transient network-level failures, not HTTP error
+            # responses, so they never reach resp.raise_for_status() below —
+            # without this, a single dropped connection deep into a large
+            # object type would crash the whole script uncaught instead of
+            # just retrying. Backoff and retry the same as a 429.
+            last_network_error = e
+            wait = 2 ** attempt
+            log.warning(f"Network error calling {path} ({e}), retrying in {wait}s")
+            time.sleep(wait)
+            continue
         if resp.status_code == 429:
             wait = 2 ** attempt
             log.warning(f"Rate limited on {path}, sleeping {wait}s")
@@ -159,6 +173,8 @@ def hubspot_request(method, path, **kwargs):
             continue
         resp.raise_for_status()
         return resp.json()
+    if last_network_error:
+        raise RuntimeError(f"Repeated network errors on {path}, giving up: {last_network_error}")
     raise RuntimeError(f"Repeated rate limiting on {path}, giving up")
 
 
