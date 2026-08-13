@@ -32,4 +32,4 @@ jobs:
           WASABI_BUCKET: ${{ secrets.WASABI_BUCKET }}
           WASABI_REGION: ${{ secrets.WASABI_REGION }}
           FULL_SYNC: ${{ github.event.inputs.full_sync || 'false' }}
-        run: python backup_hubspot_to_wasabi.py
+        run: python -u backup_hubspot_to_wasabi.py
